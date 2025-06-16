@@ -1,0 +1,8 @@
+pandas
+databricks-sql-connector
+langchain
+langgraph
+rich
+langchain_community
+openai
+langchain-openai
