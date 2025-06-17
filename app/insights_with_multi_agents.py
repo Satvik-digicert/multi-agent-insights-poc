@@ -11,6 +11,14 @@ from langgraph.graph import StateGraph, END
 from datetime import datetime
 from rich.console import Console
 from rich.markdown import Markdown
+from rich_pixels import Pixels
+import matplotlib.pyplot as plt
+import io
+import base64
+from app.utils import (
+    generate_visualization,
+    image_to_base64,
+)
 
 
 ### ---- Configuration ---- ###
@@ -52,6 +60,7 @@ class GraphState(TypedDict):
     queries_executed: Annotated[List[str], "List of executed SQL queries"]
     query_results: Annotated[List[dict], "List of dicts: {'query': str, 'result': DataFrame}"]
     insights: Annotated[List[dict], "List of dicts: {'query': str, 'insight': str, 'score': float}"]
+    graph_image: Annotated[str, "Path to the generated graph image"]  # <-- Added
 
 ### ---- LLM Setup ---- ###
 
@@ -69,26 +78,34 @@ md_log_path = "insights.md"      # changed filename
 persisted_html_log_path = "insights_persisted.html"
 persisted_md_log_path = "insights_persisted.md"
 
-def persist_rich_logs():
-    # Export HTML log for this run (overwrite)
+def persist_rich_logs(console=None):
+    """
+    Persist logs to HTML and Markdown files. Expects a rich.Console object if provided.
+    """
+    html_log_path = "insights.html"
+    md_log_path = "insights.md"
+    persisted_html_log_path = "insights_persisted.html"
+    persisted_md_log_path = "insights_persisted.md"
+    if console is None:
+        print("No console provided for exporting logs.")
+        return
     html = console.export_html(clear=False)
     with open(html_log_path, "w") as f:
         f.write(html)
-    # Export Markdown log for this run (overwrite)
     md = console.export_text(clear=False)
     with open(md_log_path, "w") as f:
         f.write(md)
-    # Append HTML log to persisted file
     with open(persisted_html_log_path, "a") as f:
         f.write(html)
         f.write("\n<!-- --- End of Run --- -->\n")
-    # Append Markdown log to persisted file
     with open(persisted_md_log_path, "a") as f:
         f.write(md)
         f.write("\n--- End of Run ---\n")
 
-### ---- Databricks Query ---- ###
-def execute_query(query: str) -> pd.DataFrame:
+
+def execute_query(query: str, DATABRICKS_CONFIG=None) -> pd.DataFrame:
+    if DATABRICKS_CONFIG is None:
+        raise ValueError("DATABRICKS_CONFIG must be provided")
     with sql.connect(
         server_hostname=DATABRICKS_CONFIG["server_hostname"],
         http_path=DATABRICKS_CONFIG["http_path"],
@@ -96,11 +113,13 @@ def execute_query(query: str) -> pd.DataFrame:
         _tls_no_verify=True
     ) as connection:
         cursor = connection.cursor()
-        console.log(f"[QUERY LOG] Executing SQL Query: {query}")
+        print(f"[QUERY LOG] Executing SQL Query: {query}")
         cursor.execute(query)
         rows = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
-        return pd.DataFrame(rows, columns=columns)
+        df = pd.DataFrame(rows, columns=columns)
+        print(f"[QUERY LOG] DataFrame shape: {df.shape}")
+        return df
 
 ### ---- Agent: Query Generator ---- ###
 def query_agent(_: dict) -> GraphState:
@@ -121,9 +140,7 @@ def query_agent(_: dict) -> GraphState:
     executed_queries = []
     for query in queries:
         try:
-            print(f' query : {query}')
-            df = execute_query(query)
-            print(f'df shape: {df.shape} ')
+            df = execute_query(query, DATABRICKS_CONFIG)
             results.append({"query": query, "result": df})
             executed_queries.append(query)
         except Exception as e:
@@ -136,12 +153,33 @@ def query_agent(_: dict) -> GraphState:
         "insights": []
     }
 
+
+### ---- Agent: Visualization Generator ---- ###
+def visualization_agent(state: GraphState) -> GraphState:
+    """
+    For each query result, generate a visualization and add the image path to the insight dict.
+    """
+    new_query_results = []
+    for item in state["query_results"]:
+        df = item["result"]
+        query = item["query"]
+        query_hash = str(abs(hash(query)))[:8]
+        img_filename = generate_visualization(df, query_hash)
+        item = {**item, "visualization": img_filename}
+        new_query_results.append(item)
+    return {
+        **state,
+        "query_results": new_query_results
+    }
+
 ### ---- Agent: Insight Generator ---- ###
 def insight_generator(state: GraphState) -> GraphState:
     insights = []
     for item in state["query_results"]:
         query = item["query"]
         df = item["result"]
+        img_filename = item.get("visualization")
+        print(f' img_filename in insight_generator : {img_filename}')
         prompt = f"""
         You are a data analyst. Given the following query and its results, generate a short insight (2-3 sentences).
         Also assign a score from 0 to 1 indicating how insightful the data is.
@@ -160,17 +198,28 @@ def insight_generator(state: GraphState) -> GraphState:
         print(f' insight : {df.head(5)} ')
 
         result = llm.invoke(prompt)
-        # Replace the parsing block in insight_generator with this:
         try:
             print(f' insight result : {result.content}')
-            # Split and filter out empty lines
             lines = [line for line in result.content.splitlines() if line.strip()]
             insight = next((line.replace("Insight:", "").strip() for line in lines if line.startswith("Insight:")), "")
             score_line = next((line for line in lines if line.startswith("Score:")), "Score: 0")
             score = float(score_line.replace("Score:", "").strip())
-            insights.append({"query": query, "insight": insight, "score": score})
+            insights.append({
+                "query": query,
+                "insight": insight,
+                "score": score,
+                "visualization": img_filename
+            })
             console.rule("[bold green]=== Insight Generated ===")
-            console.print(Markdown(f"**Insight:** {insight}\n\n**Score:** {score}\n\n**Query:**\n{query}"))
+            # Embed image as base64 if available
+            if img_filename and os.path.exists(img_filename):
+                b64img = image_to_base64(img_filename)
+                md_img = f'<img src="data:image/png;base64,{b64img}" alt="Visualization" style="max-width: 600px;"/>\n\n'
+            else:
+                md_img = ""
+            console.print(Markdown(
+                f"{md_img}**Insight:** {insight}\n\n**Score:** {score}\n\n**Query:**\n{query}"
+            ))
         except Exception as e:
             console.log(f"[INSIGHT ERROR] Failed to parse insight for query: {query}\nError: {str(e)}")
             continue
@@ -183,10 +232,12 @@ def insight_generator(state: GraphState) -> GraphState:
 ### ---- Graph Wiring ---- ###
 graph = StateGraph(GraphState)
 graph.add_node("query_agent", query_agent)
+graph.add_node("visualization_agent", visualization_agent)
 graph.add_node("insight_agent", insight_generator)
 
 graph.set_entry_point("query_agent")
-graph.add_edge("query_agent", "insight_agent")
+graph.add_edge("query_agent", "visualization_agent")
+graph.add_edge("visualization_agent", "insight_agent")
 graph.add_edge("insight_agent", END)
 
 multi_agent_graph = graph.compile()
@@ -196,20 +247,39 @@ if __name__ == "__main__":
     console.rule("[bold magenta]=== Executing Multi-Agent BI Workflow ===")
     result = multi_agent_graph.invoke({})
 
+    # Generate and save the graph image
+    png_data = multi_agent_graph.get_graph().draw_mermaid_png()
+    graph_img_path = "graph.png"
+    with open(graph_img_path, "wb") as f:
+        f.write(png_data)
+    #result["graph_image"] = graph_img_path  # <-- Add to state
+
     console.rule("[bold blue]=== Executed Queries ===")
     for q in result["queries_executed"]:
         console.print(Markdown(f"- `{q}`"))
 
     console.rule("[bold green]=== Insights (Sorted by Score) ===")
     for item in result["insights"]:
+        img_filename = item.get("visualization")
+        if img_filename and os.path.exists(img_filename):
+            b64img = image_to_base64(img_filename)
+            # Use Markdown image syntax for compatibility with rich and Markdown/HTML export
+            md_img = f'![Visualization](data:image/png;base64,{b64img})\n\n'
+        else:
+            md_img = ""
+        pixels = Pixels.from_image_path(img_filename)
+        console.print(pixels)
         console.print(Markdown(
-            f"\n**Score:** {item['score']:.2f}\n\n**Insight:** {item['insight']}\n\n**Query:**\n{item['query']}\n"
+            f"**Image:**\n{md_img}**Score:** {item['score']:.2f}\n\n**Insight:** {item['insight']}\n\n**Query:**\n{item['query']}\n"
         ))
 
+    """
     console.rule("[bold yellow]=== Graph Visualization (Mermaid PNG) ===")
-    png_data = multi_agent_graph.get_graph().draw_mermaid_png()
-    with open("graph.png", "wb") as f:
-        f.write(png_data)
-    console.print("Graph saved as `graph.png`")
-
-    persist_rich_logs()
+    if os.path.exists(graph_img_path):
+        b64_graph_img = image_to_base64(graph_img_path)
+        graph_md_img = f'<img src="data:image/png;base64,{b64_graph_img}" alt="Graph Visualization" style="max-width: 600px;"/>'
+        console.print(Markdown(graph_md_img))
+        console.print(f"Graph saved as `{graph_img_path}`")
+        
+    """
+    persist_rich_logs(console)

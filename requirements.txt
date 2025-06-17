@@ -6,3 +6,5 @@ rich
 langchain_community
 openai
 langchain-openai
+matplotlib
+gradio>=3.50,<4.0
